@@ -12,7 +12,7 @@
 
 import requests, time, random, os, pprint, re, math, json, copy
 from urllib3.exceptions import ConnectTimeoutError
-from requests.exceptions import ProxyError
+from requests.exceptions import ConnectionError,ProxyError,ReadTimeout
 from bs4 import BeautifulSoup
 from settings import DevelopmentConfig as DEVConfig
 from logger import log as logger
@@ -22,6 +22,26 @@ import pymongo
 # 移除ssl认证警告
 requests.packages.urllib3.disable_warnings()
 
+
+def getCollege():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),"college.txt")
+    with open(path,"rb") as fileHandle:
+        collegeStr = fileHandle.read()
+    collegeLst = collegeStr.decode("utf8").split("\r\n")
+    return collegeLst
+
+
+def delCollege(college, move):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "college.txt")
+    #with open(path, "rb") as fileHandle:
+    #    collegeStr = fileHandle.read()
+    #newCollegeStr = collegeStr.replace((college + "\r\n").encode("utf8"), b"")
+    #with open(path, "wb") as fileHandle:
+    #    fileHandle.write(newCollegeStr)
+    #if move:
+    #    delPath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "delCollege.txt")
+    #    with open(delPath, "a") as fileHandle:
+    #        fileHandle.write(college + "\r")
 
 
 def getProxies():
@@ -33,15 +53,14 @@ def getProxies():
             for item in response["data"]:
                 proxy["http"] = "http://{ip}:{port}".format(**item)
                 proxy["https"] = "https://{ip}:{port}".format(**item)
-            logger.info("请求代理：%s"%proxy)
+            logger.info("%s"%proxy)
+            return proxy 
         else:
             logger.info(response["msg"])
-            time.sleep(20)
+            time.sleep(10)
             return getProxies()
-        
-        return proxy
     except Exception as e:
-        logger.info(f"获取代理失败：{e}")
+        logger.info(f"请求代理异常：{e}")
         time.sleep(20)
         return getProxies()
 
@@ -51,34 +70,23 @@ class paperSpider(object):
     """
         知网博硕士论文爬虫
     """
-    def __init__(self, currentPage, year, subject, maxPage, proxy):
+    def __init__(self, currentPage, year, college, maxPage):
         try:
             # 当前页
             self.currentPage = currentPage
             # 年份
             self.year = year
-            # 学科专业
-            self.subject = subject
+            # 学术机构
+            self.college = college
             # 每次最多处理的页数
             self.maxPage = maxPage
-            # 获取代理IP 处理一下获取不到代理的情况
-            self.proxy = proxy
             self.headers = {"User-Agent": random.choice(DEVConfig.USER_AGENTS)}
-            # 保持会话
-            self.session = requests.Session()
-            self.session.get(DEVConfig.BASIC_URL,proxies=self.proxy,timeout=30)
             # 连接mongodb
             self.client = pymongo.MongoClient(DEVConfig.MONGO_URL)
-            logger.info("构建新的session")
             self.connStatus = "ok"
-        except ConnectTimeoutError as ce:
-            logger.info("[init]ConnectTimeoutError,current pageno:%d,%s"%(self.currentPage,ce))
-            self.connStatus = "ConnectTimeoutError"
-        except ProxyError as pe:
-            logger.info("[init]ProxyError,current pageno:%d,%s"%(self.currentPage,pe))
-            self.connStatus = "ProxyError"
         except Exception as e:
-            logger.info(f"other exception:{e}")
+            raise
+            logger.error(f"init error:{e}")
             self.connStatus = "OtherException"
 
 
@@ -100,7 +108,7 @@ class paperSpider(object):
                         还是继续处理出现验证码的这一页
         """
         # 第一次http请求，相当于注册操作
-        searchHandle = "".join([
+        searchHandleList = "".join([
             DEVConfig.SEARCH_HANDLE_URL,
             "action={action}&",
             "NaviCode={NaviCode}&",
@@ -117,87 +125,128 @@ class paperSpider(object):
             "__={__}&",
             "year_from={year_from}&",
             "year_to={year_to}&",
-            "txt_1_sel={txt_1_sel}&",
-            "txt_1_value1={txt_1_value1}&",
-            "txt_1_relation={txt_1_relation}&",
-            "txt_1_special1={txt_1_special1}"
+            "degreedanwei_value1={degreedanwei_value1}&",
+            "degreedanwei_special1={degreedanwei_special1}"
         ])
         searchHandleDic = copy.deepcopy(DEVConfig.SEARCH_HANDLE)
-        searchHandleDic.update({"year_from":self.year,
-                                "year_to":self.year,
-                                "txt_1_sel":"XF",
-                                "txt_1_value1":quote(self.subject),
-                                "txt_1_relation":"#CNKI_AND",
-                                "txt_1_special1":"="})
-        url = searchHandle.format(**searchHandleDic)
+        searchHandleDic.update({"year_from": self.year,
+                                "year_to": self.year,
+                                "degreedanwei_special1": "=",
+                                "degreedanwei_value1": quote(self.college)}
+                                )
         try:
-            response = self.session.get(url,proxies=self.proxy,timeout=30)
-            if not response:
-                logger.error("[SEARCH_HANDLE_URL]get no search handle,spider probably running irregularly,exit ")
-                #return False
-                time.sleep(300)
-                return self.currentPage - 1
-            searchHandle = response.text
-            logger.debug(searchHandle)
+            # 20201125 193300 发生it's not an expected result时，response的code是200，是正常的http响应。searchHandle为空，没有searchHandle，下文的搜索自然为空
+            cnt = 1
+            while cnt <= 3:
+                self.session = requests.Session()
+                #self.proxy = getProxies()
+                searchHandleDic.update({"__": quote(time.asctime(time.localtime()) + " GMT+0800 (中国标准时间)")})
+                url = searchHandleList.format(**searchHandleDic)
+                logger.info(f"[Search Handle]第{cnt}次请求searchHandle，最多请求三次")
+                response = self.session.get(url, headers=self.headers, proxies=self.proxy, timeout=30)
+                if not response:
+                    logger.error("[Search Handle]get no search handle,sleep 300 seconds")
+                    time.sleep(300)
+                    return self.currentPage - 1
+                searchHandle = response.text
+                if searchHandle:
+                    logger.info(f"[Search Handle]成功获取searchHandle:{searchHandle}，模拟检索操作")
+                    break
+                else:
+                    if cnt < 3:
+                        logger.info("[Search Handle]未获取到searchHandle,可能是因为网络原因，也可能是不存在本学术机构的文献数据，10秒后进入下一次重试")
+                        time.sleep(10)
+                    cnt += 1
+            else:
+                # 三次重试后扔未获取到searchHandle，直接return False，开始检索下一学术机构文献
+                logger.info("[Search Handle]max retries exceeded with searchHandle,return False,scan next college")
+                return False
             # 第二次，“检索”按钮执行后的查询结果
             timestamp = str(int(time.time() * 1000))
             # get请求中需要传入第一个检索条件的值（学科专业）
-            key_value = quote(self.subject)
+            #key_value = quote(self.subject)
+            key_value = ""
             self.getPageUrl = DEVConfig.GET_PAGE_URL + searchHandle + "&t=" + timestamp + "&keyValue=" + key_value + "&S=1&sorttype="
             response = self.session.get(self.getPageUrl, headers=self.headers,proxies=self.proxy,timeout=30)
             if not response:
-                logger.error("[click check button]get no result,exit")
+                logger.error("[Click Check Button]get no result,sleep 180 seconds")
                 # return False
-                time.sleep(300)
+                time.sleep(180)
                 return self.currentPage - 1
-            # 页面跳转
-            changePagePattern = re.compile(r'.*?pagerTitleCell.*?<a href="(.*?)".*')
             try:
-                self.changePageUrl = re.search(changePagePattern, response.text).group(1)
-                referencNumPattern  = re.compile(r".*?找到&nbsp;(.*?)&nbsp;")
+                referencNumPattern = re.compile(r".*?找到&nbsp;(.*?)&nbsp;")
                 referenceNum = re.search(referencNumPattern, response.text).group(1)
-                referenceNumInt = str(int(referenceNum.replace(",", "")))
-                self.referencePages = math.ceil(int(referenceNum.replace(",", ""))/20)
-                logger.info("检索到" + referenceNumInt + "条结果，共计" + str(self.referencePages) + "页")
-                logger.info("开始处理第%d页"%self.currentPage)
+                referenceNum = int(referenceNum.replace(",", ""))
+                referenceNumStr = str(referenceNum)
+                self.referencePages = math.ceil(referenceNum / 20)
+                logger.info("[Click Check Button]检索到" + referenceNumStr + "条结果，共计" + str(self.referencePages) + "页")
+                if referenceNum == 0:
+                    logger.info("[Click Check Button][%s]的论文文献数量为0，跳过" % self.college)
+                    delCollege(self.college, True)
+                    return False
+                if self.currentPage > self.referencePages or self.currentPage > 300:
+                    logger.info("[Search Reference]扫描超出最大页码范围，退出并删除该学术机构，开始下一个学术机构文献的扫描")
+                    delCollege(self.college, False)
+                    return False
+                if self.referencePages > 1:
+                    # 页面跳转
+                    changePagePattern = re.compile(r'.*?pagerTitleCell.*?<a href="(.*?)".*')
+                    self.changePageUrl = re.search(changePagePattern, response.text).group(1)
                 # 支持跳页扫描
                 if self.currentPage > 1:
                     res = self.getOtherPage(self.maxPage)
                 else:
-                    res = self.parsePage(response.text, self.maxPage)
+                    res = self.parsePage(response.text, self.maxPage-1)
+                    #res = self.parsePage(response.text, self.maxPage)
                 if res == "Captcha Code":
                     return self.currentPage - 1
                 elif res == "Scan Over":
                     return False
-                elif res == "Connection Error":
+                elif res == "Detail Error":
                     # 扫描过程中代理IP失效，记录当前页码，更换代理IP后重新扫描这一页
-                    logger.info("[searchReference]获取详情出错,%d"%(self.currentPage - 1))
                     return self.currentPage - 1
                 else:
                     return self.currentPage
+            except ConnectionError as ce:
+                logger.error(f"[Get Other Page]ConnectionError,current pageno:%d,%s" % (self.currentPage, ce))
+                time.sleep(180)
+                return self.currentPage - 1
             except ProxyError as pe:
-                # 发生此异常，一般是位于getOtherPage中的数据请求，等待5分钟后重新处理本页，而不是直接跳过该学科
-                logger.error("[click check button]ProxyError,current pageno:%d,%s" % (self.currentPage, pe))
-                time.sleep(300)
+                # 发生此异常，一般是位于getOtherPage中的数据请求，等待3分钟后重新处理本页，而不是直接跳过该学科
+                logger.error("[Get Other Page]ProxyError,current pageno:%d,%s" % (self.currentPage, pe))
+                time.sleep(180)
+                return self.currentPage - 1
+            except ReadTimeout as rt:
+                logger.error(f"[Get Other Page]ReadTimeout,current pageno:%d,%s" % (self.currentPage, rt))
+                time.sleep(180)
                 return self.currentPage - 1
             except Exception as e:
                 # 虽然request有响应，但响应内容并非预期
-                logger.error(f"[click check button]it's not an expected result:{e}")
+                logger.error(f"[Get Other Page]it's not an expected result:{e}")
                 return False
-        except ConnectTimeoutError as ce:
+        except ConnectionError as ce:
+            logger.error(f"[Click Check Button]ConnectionError,current pageno:%d,%s" % (self.currentPage, ce))
+            time.sleep(180)
+            return self.currentPage - 1
+        except ConnectTimeoutError as cte:
             # 扫描过程中代理IP失效，记录当前页码，更换代理IP后重新扫描这一页
-            logger.error("[searchReference]ConnectTimeoutError,current pageno:%d,%s"%(self.currentPage,ce))
-            time.sleep(10)
+            logger.error("[Click Check Button]ConnectTimeoutError,current pageno:%d,%s"%(self.currentPage,cte))
+            time.sleep(180)
             return self.currentPage - 1
         except ProxyError as pe:
-            logger.error("[searchReference]ProxyError,current pageno:%d,%s"%(self.currentPage,pe))
-            time.sleep(10)
+            logger.error("[Click Check Button]ProxyError,current pageno:%d,%s"%(self.currentPage,pe))
+            time.sleep(180)
+            return self.currentPage - 1
+        except ReadTimeout as rt:
+            logger.error(f"[Click Check Button]ReadTimeout,current pageno:%d,%s" % (self.currentPage, rt))
+            time.sleep(180)
             return self.currentPage - 1
         except Exception as e:
             logger.error(e)
             return False
 
     def parsePage(self, pageSource, leftPage):
+        logger.info("[Parse Page]正在处理第%d页" % self.currentPage)
         soup = BeautifulSoup(pageSource, "lxml")
         keyList = ["title", "author", "college", "degree", "year", "detail"]
         # 定位到内容表区域
@@ -208,7 +257,7 @@ class paperSpider(object):
             tr_table.tr.extract()
         except Exception as e:
             # sleep10分钟后，强制使searchReference方法return以退出本次循环，进入下一次10页的轮询
-            logger.error("出现验证码，等待十分钟后退出本次循环，刷新session，重新处理本页")
+            logger.error("[Parse Page]出现验证码，等待十分钟后退出本次循环，刷新session，重新处理本页")
             time.sleep(600)
             return "Captcha Code"
             #return self.parse_page(
@@ -230,7 +279,7 @@ class paperSpider(object):
                     if aTag:
                         detailUrl = aTag.attrs["href"]
                     else:
-                        logger.info("do not find detail url")
+                        logger.error("do not find detail url")
                         detailUrl = ""
                 else:
                     for string in td.stripped_strings:
@@ -239,33 +288,43 @@ class paperSpider(object):
                         tdText += string
                 if 1 <= idx <= 5:
                     tdList.append(tdText)
-            # modify by qiuy @ 20201102 174300 mongodb里加入详情页的完整url
-            tdList.append("http://kns.cnki.net" + detailUrl)
+            # modify by qiuy @ 20201102 174300 mongodb里加入文献详情的完整url
+            tdList.append("https://kns.cnki.net" + detailUrl)
             tdDict = dict(zip(keyList, tdList))
             title = tdDict.get("title")
-            # 解析详情页
-            detailDict = pageDetail.getDetailPage(self.session, self.proxy, self.getPageUrl,
-                                detailUrl, self.year, self.subject, title)
-            if detailDict == "Error":
-                logger.info("获取详情错误，应该重爬本页")
-                return "Connection Error"
+            # 解析文献详情，因网络故障最多重试三次，三次后更换代理重新处理本页
+            cnt = 0
+            while cnt < 3:
+                detailDict = pageDetail.getDetailPage(self.session, self.proxy, self.getPageUrl, detailUrl, self.year, self.college, title)
+                if detailDict == "Error":
+                    logger.error("[Get Detail Page]failed,sleep 5 seconds,then try again]")
+                    cnt += 1
+                    time.sleep(5)
+                    continue
+                else:
+                    break
+            else:
+                logger.info("[Get Detail Page]max retries exceeded with this detail,re-download all papers of page %d"%self.currentPage)
+                return "Detail Error"
             tdDict.update(detailDict)
             trList.append(tdDict)
+            logger.info(title)
             time.sleep(4)
         self.savePaper(self.currentPage, trList, self.client)
-        if leftPage > 1:
+        if leftPage >= 1:
             self.currentPage += 1
             if self.currentPage > self.referencePages or self.currentPage > 300:
-                logger.info("扫描超出最大页码范围，退出，开始下一个学科专业文献的扫描")
+                logger.info("[Parse Page]扫描超出最大页码范围，退出，开始下一个学术机构文献的扫描")
+                delCollege(self.college, False)
                 return "Scan Over"
-            else:
+           # else:
                 # 注意此处必须return，用一个例子来说明一下不加return的结果
                 # 假定一次检索只有2页内容（25篇论文），当self.currentPage累加到2的时候调用self.getOtherPage方法，注意，此时没有return
                 # 在self.getOtherPage方法里又继续调用self.parsePage方法，此时self.currentPage累计到3，触发Scan Over，因为206行调用
                 # self.getOtherPage没有return，所以继续执行205行的return True。这样就导致了self.searchReference在第132行return self.currentPage
                 # 该值为3。转到while循环里，spider.searchReference的返回值为3，满足else条件，继续加1，变成了4。因此进行下一次while的轮询时，就变成了
                 # 从第4页开始，而第4页没有任何内容，触发了click check button异常，退出了while循环。
-                return self.getOtherPage(leftPage)
+            return self.getOtherPage(leftPage)
         return True
 
     def getOtherPage(self,leftPage):
@@ -275,17 +334,17 @@ class paperSpider(object):
         重新构造请求
         """
         curpagePattern = re.compile(r".*?curpage=(\d+).*?")
-        logger.info("正在处理第%d页" % self.currentPage)
         self.otherPageUrl = DEVConfig.CHANGE_PAGE_URL + re.sub(
-            curpagePattern, "?curpage=" + str(self.currentPage),  # + str(startPage)
+            curpagePattern, "?curpage=" + str(self.currentPage),
             self.changePageUrl)
         logger.info(self.otherPageUrl)
+        # 试一下，在这里优化，减少出现not an except result的情况,重试三次
         response = self.session.get(self.otherPageUrl, headers=self.headers, proxies=self.proxy,timeout=30)
         leftPage -= 1
         return self.parsePage(response.text, leftPage)
 
     def savePaper(self, title, paper, client):
-        path = os.path.join(DEVConfig.BRIEF_PATH,"data",self.year,self.subject)
+        path = os.path.join(DEVConfig.BRIEF_PATH,"data",self.year,self.college)
         if not os.path.isdir(path):
             logger.info(f"目录[{path}]不存在，创建目录")
             os.makedirs(path)
@@ -298,55 +357,41 @@ class paperSpider(object):
 
 
 if __name__ == "__main__":
-    currentPage = 1
-    for year in ["2020", "2019", "2018"]:
-        logger.info(f"正在处理[{year}]年的数据")
-        for subject in DEVConfig.SUBJECT:
-
-            logger.info(f"正在处理学科为[{subject}]的数据")
-            while True:
-                proxy = getProxies()
-                spider = paperSpider(currentPage, year, subject, 10, proxy)
-                if spider.connStatus in ("ConnectTimeoutError","ProxyError"):
-                # 这里需要测试一下，比如，处理到第五页，主动抛出connection异常，测试下一次的currentpage是不是5
-                    continue
-                if spider.connStatus == "OtherException":
-                    logger.info("突发其他异常，程序退出")
-                    exit()
-                currentPage = spider.searchReference()
-                logger.info("=================")
-                logger.info(currentPage)
-                # 0 == False  True
-                if  type(currentPage) == bool and currentPage == False:
-                    # 知网最多支持爬取300页，爬完300页后退出，并重置起始页码
-                    #logger.info("can not find more information,break,and scan next subject")
-                    currentPage = 1
-                    break
-                else:
-                    currentPage += 1
+    collegeLst = getCollege()
+    #currentPage = 1
+    year = DEVConfig.YEAR
+    logger.info(f"正在处理[{year}]年的数据")
+    for college in collegeLst:
+        path = os.path.join(DEVConfig.BRIEF_PATH, "data", year, college)
+        if os.path.isdir(path):
+            fileNum = len(os.listdir(path))
+        else:
+            fileNum = 0
+        logger.info(f"正在处理学术机构为[{college}]的数据，当前共有[{fileNum}]页")
+        currentPage = fileNum + 1
+        if fileNum == 300:
+            logger.info(f"[Main]该学术机构的论文下载数量已超过最大值，中止本次扫面，并删除该学术机构")
+            delCollege(college, False)
+            time.sleep(2)
+            continue
+        while True:
+            logger.info("[Main]启动新的一轮数据读取，建立爬虫类")
+            spider = paperSpider(currentPage, year, college, 10)
+            #if spider.connStatus in ("ConnectTimeoutError","ProxyError"):
+            # 这里需要测试一下，比如，处理到第五页，主动抛出connection异常，测试下一次的currentpage是不是5
+            #    continue
+            if spider.connStatus == "OtherException":
+                logger.info("突发其他异常，程序退出")
+                exit()
+            logger.info("[Main]请求代理，构建session，查询该学术机构的论文文献")
+            currentPage = spider.searchReference()
+            # 0 == False  True
+            if type(currentPage) == bool and currentPage == False:
+                # 知网最多支持爬取300页，爬完300页后退出，并重置起始页码
+                #logger.info("can not find more information,break,and scan next subject")
+                #currentPage = 1
                 time.sleep(2)
-
-    #while True:
-    #    spider = paperSpider(currentPage, "2000", "生物化学与分子生物学", 10)
-    #    if spider.connStatus in ("ConnectTimeoutError","ProxyError"):
-    #        # 这里需要测试一下，比如，处理到第五页，主动抛出connection异常，测试下一次的currentpage是不是5
-    #        continue
-    #    if spider.connStatus == "OtherException":
-    #        logger.info("突发其他异常，程序退出")
-    #        exit()
-    #    currentPage = spider.searchReference()
-    #    if not currentPage:
-    #        # 知网最多支持爬取300页，爬完300页后退出，并重置起始页码
-    #        #logger.info("can not find more information,break,and scan next subject")
-    #        currentPage = 1
-    #        break
-    #    else:
-    #        # 这里需要测试一下，可以设定每次扫描的页数少一些，比如2和3，测一下在不满2页和超过2页的情况下currentpage是否正确
-    #        currentPage += 1
-    #print("--------")
-    #print(currentPage)
-
-
-
-
-
+                break
+            else:
+                currentPage += 1
+            time.sleep(2)
